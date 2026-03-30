@@ -473,32 +473,44 @@ def get_stock_realtime_quote(symbol: str) -> dict:
 
 
 def _get_realtime_ak(symbol: str) -> dict:
+    """
+    Derive real-time quote from the last 2 days of history.
+    Avoids downloading all 5000+ stocks via stock_zh_a_spot_em (very slow).
+    """
     import akshare as ak
-    result, err = _with_retry(ak.stock_zh_a_spot_em, label=f"实时行情({symbol})")
-    if err or result is None:
+    result, err = _with_retry(
+        ak.stock_zh_a_hist,
+        symbol=symbol, period="daily",
+        start_date=_start_date(10), end_date=_today(),
+        adjust="",          # unadjusted for most accurate latest price
+        label=f"实时行情({symbol})",
+    )
+    if err or result is None or result.empty:
         return mock.mock_stock_realtime_quote(symbol)
     try:
-        row = result[result["代码"] == symbol]
-        if row.empty:
+        df = _normalise_ohlcv(result)
+        if len(df) < 1:
             return mock.mock_stock_realtime_quote(symbol)
-        r = row.iloc[0]
+        last = df.iloc[-1]
+        prev = df.iloc[-2] if len(df) >= 2 else last
+        price      = float(last["close"])
+        prev_close = float(prev["close"])
         return {
-            "code":         r.get("代码", symbol),
-            "name":         r.get("名称", ""),
-            "price":        r.get("最新价"),
-            "change_pct":   r.get("涨跌幅"),
-            "change_amt":   r.get("涨跌额"),
-            "volume":       r.get("成交量"),
-            "amount":       r.get("成交额"),
-            "amplitude":    r.get("振幅"),
-            "high":         r.get("最高"),
-            "low":          r.get("最低"),
-            "open":         r.get("今开"),
-            "prev_close":   r.get("昨收"),
-            "volume_ratio": r.get("量比"),
-            "turnover":     r.get("换手率"),
-            "pe_ratio":     r.get("市盈率-动态"),
-            "market_cap":   r.get("总市值"),
+            "code":         symbol,
+            "name":         _BUILTIN_STOCK_LIST.get(symbol, symbol),
+            "price":        price,
+            "change_pct":   float(last.get("change_pct") or 0),
+            "change_amt":   round(price - prev_close, 3),
+            "volume":       int(last["volume"]) if pd.notna(last["volume"]) else None,
+            "amount":       float(last.get("amount") or 0),
+            "high":         float(last["high"]),
+            "low":          float(last["low"]),
+            "open":         float(last["open"]),
+            "prev_close":   prev_close,
+            "volume_ratio": None,   # calculated by indicators.py
+            "turnover":     float(last["turnover"]) if pd.notna(last.get("turnover")) else None,
+            "pe_ratio":     None,
+            "market_cap":   None,
         }
     except Exception:
         return mock.mock_stock_realtime_quote(symbol)
@@ -532,6 +544,15 @@ def search_stock(query: str) -> pd.DataFrame:
 
 
 def _search_ak(query: str) -> pd.DataFrame:
+    q = query.strip()
+
+    # If query is a pure 6-digit code, return immediately — no network call needed.
+    # Fetching all 5000+ stocks just to match one code is extremely slow.
+    if q.isdigit() and len(q) == 6:
+        name = _BUILTIN_STOCK_LIST.get(q, q)
+        return pd.DataFrame([{"code": q, "name": name}])
+
+    # Name search — must fetch full market list (slow on akshare from overseas)
     import akshare as ak
     result, err = _with_retry(ak.stock_zh_a_spot_em, label="股票搜索")
     if err or result is None:
@@ -539,7 +560,6 @@ def _search_ak(query: str) -> pd.DataFrame:
         return mock.mock_search_stock(query)
     try:
         df = result[["代码", "名称"]].rename(columns={"代码": "code", "名称": "name"})
-        q = query.strip()
         mask = (
             df["code"].str.contains(q, case=False, na=False) |
             df["name"].str.contains(q, case=False, na=False)
